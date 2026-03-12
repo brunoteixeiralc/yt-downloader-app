@@ -2,22 +2,19 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import subprocess
 import threading
-import json
+import re
 import os
 import sys
 
 # --- Determina os caminhos dos recursos ---
-# No ambiente de desenvolvimento, os executáveis podem estar em outro lugar.
-# Dentro do app py2app, eles estão na pasta Resources.
-if hasattr(sys, 'frozen'):
-    # Estamos em um bundle py2app
-    RESOURCES_PATH = os.path.join(os.path.dirname(sys.executable), '..', 'Resources')
+# PyInstaller define sys._MEIPASS com o caminho dos binários bundled.
+if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+    BASE_PATH = sys._MEIPASS        # Bundle PyInstaller
 else:
-    # Ambiente de desenvolvimento
-    RESOURCES_PATH = "/opt/homebrew/bin" # Ou onde quer que eles estejam
+    BASE_PATH = "/opt/homebrew/bin" # Desenvolvimento local
 
-YT_DLP_PATH = os.path.join(RESOURCES_PATH, "yt-dlp")
-FFMPEG_PATH = os.path.join(RESOURCES_PATH, "ffmpeg")
+YT_DLP_PATH = os.path.join(BASE_PATH, "yt-dlp")
+FFMPEG_PATH = os.path.join(BASE_PATH, "ffmpeg")
 
 
 def open_file_in_finder(path):
@@ -43,68 +40,77 @@ def download_video():
 def run_yt_dlp(url):
     try:
         downloads_path = os.path.join(os.path.expanduser("~"), "Downloads")
-        
-        # Comando para yt-dlp
-        # -f: Define o formato de download. Tenta o melhor vídeo mp4 com o melhor áudio m4a,
-        #     depois o melhor formato mp4 e, finalmente, o melhor formato disponível.
-        # --progress: Envia o progresso como JSON
-        # --no-warnings: Limpa a saída
+
         command = [
             YT_DLP_PATH,
-            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            # Melhor qualidade disponível; sem restringir ext para evitar
+            # o bloqueio SABR do YouTube (HTTP 403) nos streams separados.
+            "-f", "bestvideo+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+            # Usa o cliente Android para contornar o bloqueio SABR do YouTube.
+            "--extractor-args", "youtube:player_client=android,web",
             "--ffmpeg-location", FFMPEG_PATH,
             "-o", f"{downloads_path}/%(title)s.%(ext)s",
-            "--progress",
-            "--no-warnings"
+            # Progresso em linhas separadas (em vez de \r) para poder ler linha a linha.
+            "--newline",
+            "--no-warnings",
+            # Imprime o caminho final do arquivo após mover/mesclar.
+            "--print", "after_move:filepath",
+            url,
         ]
-        
-        # Adiciona a URL ao comando
-        command.append(url)
 
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+        # Mescla stderr no stdout para ler tudo em um único loop sem deadlock.
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
 
         final_filepath = ""
-        for line in process.stdout:
-            try:
-                # Tenta decodificar a linha como JSON (para progresso)
-                progress_data = json.loads(line)
-                
-                # Atualiza a GUI a partir da thread principal
-                if progress_data.get("status") == "downloading":
-                    progress_bar.stop()
-                    progress_bar.config(mode='determinate')
-                    
-                    total_bytes = progress_data.get("total_bytes")
-                    downloaded_bytes = progress_data.get("downloaded_bytes")
-                    
-                    if total_bytes and downloaded_bytes:
-                        percent = (downloaded_bytes / total_bytes) * 100
-                        progress_bar['value'] = percent
-                        status_label.config(text=f"Baixando... {percent:.1f}%")
-                        
-                elif progress_data.get("status") == "finished":
-                    final_filepath = progress_data.get("filename")
-                    status_label.config(text="Download concluído. Convertendo...")
-                    progress_bar.config(mode='indeterminate')
-                    progress_bar.start()
+        error_lines = []
 
-            except json.JSONDecodeError:
-                # Se não for JSON, pode ser outra mensagem
-                pass
-        
+        for line in process.stdout:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Progresso: "[download]  45.2% of 32.49MiB ..."
+            match = re.search(r'\[download\]\s+(\d+\.?\d*)%', line)
+            if match:
+                percent = float(match.group(1))
+                progress_bar.stop()
+                progress_bar.config(mode='determinate')
+                progress_bar['value'] = percent
+                status_label.config(text=f"Baixando... {percent:.1f}%")
+
+            # Mescla de streams com ffmpeg
+            elif "[Merger]" in line or "Merging" in line:
+                status_label.config(text="Convertendo com ffmpeg...")
+                progress_bar.config(mode='indeterminate')
+                progress_bar.start()
+
+            # Caminho final impresso por --print after_move:filepath
+            elif line.startswith("/") and not line.startswith("//:"):
+                final_filepath = line
+
+            # Coleta linhas de erro para exibição em caso de falha
+            elif "ERROR" in line:
+                error_lines.append(line)
+
         process.wait()
         progress_bar.stop()
         progress_bar.config(mode='determinate')
 
         if process.returncode == 0:
             progress_bar['value'] = 100
-            status_label.config(text="Conversão concluída com sucesso!")
-            if messagebox.askyesno("Sucesso", f"Download concluído!\nO arquivo está em: {final_filepath}\n\nDeseja vê-lo no Finder?"):
-                print(f"Attempting to open: {final_filepath}") # Log the path
+            status_label.config(text="Download concluído!")
+            nome = os.path.basename(final_filepath) if final_filepath else "arquivo"
+            if messagebox.askyesno("Sucesso", f"Download concluído!\nArquivo: {nome}\n\nDeseja ver no Finder?"):
                 open_file_in_finder(final_filepath)
         else:
-            stderr_output = process.stderr.read()
-            messagebox.showerror("Erro no Download", f"Ocorreu um erro:\n{stderr_output}")
+            erro = "\n".join(error_lines) if error_lines else "Erro desconhecido."
+            messagebox.showerror("Erro no Download", f"Ocorreu um erro:\n{erro}")
             status_label.config(text="Falha no download.")
             progress_bar['value'] = 0
 
@@ -113,7 +119,6 @@ def run_yt_dlp(url):
         status_label.config(text="Ocorreu um erro inesperado.")
         progress_bar['value'] = 0
     finally:
-        # Reabilitar o botão
         download_button.config(state=tk.NORMAL)
 
 
