@@ -87,8 +87,14 @@ import packaging.requirements
 import packaging.specifiers
 import packaging.utils
 import packaging.version
-from jaraco.text import drop_comment, join_continuation, yield_lines
-from platformdirs import user_cache_dir as _user_cache_dir
+try:
+    from jaraco.text import drop_comment, join_continuation, yield_lines
+except ImportError:
+    from setuptools._vendor.jaraco.text import drop_comment, join_continuation, yield_lines
+try:
+    from platformdirs import user_cache_dir as _user_cache_dir
+except ImportError:
+    from setuptools._vendor.platformdirs import user_cache_dir as _user_cache_dir
 
 if TYPE_CHECKING:
     from _typeshed import BytesPath, StrOrBytesPath, StrPath
